@@ -1,61 +1,88 @@
-import express from "express";
-import axios from "axios";
-import NodeCache from "node-cache";
-
+const express = require("express");
+const axios = require("axios");
+const CurrentData = require("../models/CurrentData");
+const HistoryData = require("../models/HistoryData");
 const router = express.Router();
-const cache = new NodeCache({ stdTTL: 180 }); // cache for 3 minutes
 
+const COINGECKO_API = process.env.COINGECKO_API;
+
+// helper to map CoinGecko response
+function mapCoin(coin) {
+  return {
+    coinId: coin.id,
+    name: coin.name,
+    symbol: coin.symbol,
+    price: coin.current_price,
+    marketCap: coin.market_cap,
+    change24h: coin.price_change_percentage_24h,
+    lastUpdated: new Date(coin.last_updated),
+  };
+}
+
+// GET /api/coins
 router.get("/coins", async (req, res) => {
-  const cacheKey = "top10coins";
-  const cachedData = cache.get(cacheKey);
-
-  // ✅ Return cached data if available
-  if (cachedData) {
-    console.log("💾 Serving from cache");
-    return res.json(cachedData);
-  }
-
   try {
-    console.log("🌐 Fetching from CoinGecko...");
-    const response = await axios.get(
-      "https://api.coingecko.com/api/v3/coins/markets",
-      {
-        params: {
-          vs_currency: "usd",
-          order: "market_cap_desc",
-          per_page: 10,
-          page: 1,
-          sparkline: false
-        },
-        headers: { "Accept-Encoding": "gzip,deflate,compress" }
-      }
-    );
+    const { data } = await axios.get(COINGECKO_API);
+    const mapped = data.map(mapCoin);
 
-    const coins = response.data.map((coin) => ({
-      id: coin.id,
-      name: coin.name,
-      symbol: coin.symbol,
-      price: coin.current_price,
-      marketCap: coin.market_cap,
-      change24h: coin.price_change_percentage_24h,
-      lastUpdated: coin.last_updated
+    // Upsert CurrentData: overwrite existing docs (easy approach: bulk write)
+    const bulkOps = mapped.map((c) => ({
+      updateOne: {
+        filter: { coinId: c.coinId },
+        update: { $set: c },
+        upsert: true,
+      },
     }));
+    if (bulkOps.length) await CurrentData.bulkWrite(bulkOps);
 
-    // ✅ Cache the result
-    cache.set(cacheKey, coins);
-
-    res.json(coins);
+    res.json({ success: true, coins: mapped, lastSync: new Date() });
   } catch (err) {
-    console.error("❌ Error fetching coins:", err.message);
-
-    if (err.response && err.response.status === 429) {
-      return res.status(429).json({
-        error: "Rate limit exceeded. Please wait a few moments and try again."
-      });
-    }
-
-    res.status(500).json({ error: "Failed to fetch coins." });
+    console.error("GET /api/coins error", err.message);
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 
-export default router;
+// POST /api/history  -> store snapshot for all coins (called by cron or manual)
+// Optionally accepts ?coins=coin1,coin2 to store only those.
+router.post("/history", async (req, res) => {
+  try {
+    // fetch the latest from CoinGecko
+    const { data } = await axios.get(COINGECKO_API);
+    const mapped = data.map(mapCoin);
+
+    const docs = mapped.map((c) => ({
+      coinId: c.coinId,
+      name: c.name,
+      symbol: c.symbol,
+      price: c.price,
+      marketCap: c.marketCap,
+      change24h: c.change24h,
+      timestamp: new Date(),
+    }));
+
+    await HistoryData.insertMany(docs);
+
+    res.json({ success: true, inserted: docs.length });
+  } catch (err) {
+    console.error("POST /api/history error", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// GET /api/history/:coinId
+router.get("/history/:coinId", async (req, res) => {
+  try {
+    const { coinId } = req.params;
+    const limit = parseInt(req.query.limit || "500");
+    const data = await HistoryData.find({ coinId })
+      .sort({ timestamp: 1 })
+      .limit(limit)
+      .lean();
+    res.json({ success: true, history: data });
+  } catch (err) {
+    console.error("GET /api/history/:coinId error", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+module.exports = router;
